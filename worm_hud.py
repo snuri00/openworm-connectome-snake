@@ -7,9 +7,9 @@ Interaction:
   LMB on the worm   gentle touch (nose / anterior body / posterior body)
   LMB on the floor  place a toxin droplet (sensed by the nociceptors)
   RMB               move the food source
-  Step-rate slider and buttons below the arena, or the keys:
-  SPACE pause   M manual (arrow keys)   + / - rate   K lethal collisions
-  R new specimen   E export CSV   ESC quit
+  Speed slider and buttons below the arena, or the keys:
+  W switch world (agar plate / grid snake)   SPACE pause   M manual (grid only)
+  + / - speed   K lethal   R new specimen   E export CSV   ESC quit
 """
 import os
 
@@ -30,6 +30,10 @@ from neuron_atlas import load_atlas
 from snake_worm import (GRID_H, GRID_W, ODOR_LENGTH, TOXIN_LENGTH,
                         SnakeGame, WormController)
 from worm_brain import WormBrain
+from worm_plate import (EAT_RADIUS, PLATE_RADIUS, STEPS_PER_SECOND, TOXIN_CORE,
+                        TOXIN_LIFETIME as PLATE_TOXIN_LIFETIME, PlateWorld)
+from worm_plate import ODOR_LENGTH as PLATE_ODOR_LENGTH
+from worm_plate import TOXIN_LENGTH as PLATE_TOXIN_LENGTH
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -80,7 +84,8 @@ KEY_NEURONS = {"ASEL": "ASE", "AWCL": "AWC", "ASHL": "ASH", "ALML": "ALM", "AVM"
 RASTER_TICKS = 240        # brain ticks shown in the raster (= 40 game steps)
 TRACE_SECONDS = 20.0
 TRIAL_WINDOW = 36         # ticks after a stimulus in which a response is counted
-RATE_MIN, RATE_MAX = 0.5, 20.0   # game steps per second
+RATE_RANGE = {"grid": (0.5, 20.0),   # game steps per second
+              "plate": (0.25, 4.0)}  # simulation speed relative to real time
 FPS = 30                         # screen refresh; data changes at most 20 Hz
 
 
@@ -107,11 +112,16 @@ def colormap(v):
 
 
 class Console:
-    def __init__(self, speed):
-        self.speed = speed
+    def __init__(self, speed, world="plate"):
+        self.rates = {"grid": speed, "plate": 1.0}
         self.brain = WormBrain()
-        self.ctrl = WormController(self.brain)
-        self.game = SnakeGame()
+        self.grid_game = SnakeGame(lethal=False)
+        self.grid_ctrl = WormController(self.brain)
+        self.plate = PlateWorld(brain=self.brain)
+        self.mode = world
+        self.game = self.ctrl = self.plate
+        if world == "grid":
+            self.game, self.ctrl = self.grid_game, self.grid_ctrl
         self.canvas = pygame.Surface(CANVAS)
         self.f_xs = font(11)
         self.f_s = font(12)
@@ -136,7 +146,8 @@ class Console:
         self.dragging = False
         self.prev_body = list(self.game.body)
         self.step_progress = 1.0
-        self.game.lethal = False
+        self.prev_nodes = self.cur_nodes = np.array(self.plate.body)
+        self._last_bump = None
         self._build_controls()
         self.markers = []                 # stimulus markers on the arena: [cell, t, color]
 
@@ -192,35 +203,79 @@ class Console:
         self.raster_colors = np.array([TYPE_COLORS.get(kinds[i], MUTED) for i in order], dtype=np.uint8)
 
     def _build_controls(self):
-        self.slider = pygame.Rect(CONTROLS.x + 104, CONTROLS.y + 32, 140, 6)
+        self.slider = pygame.Rect(CONTROLS.x + 100, CONTROLS.y + 32, 124, 6)
         specs = [
             ("pause", lambda: "Resume" if self.paused else "Pause", self.toggle_pause),
             ("lethal", lambda: "Lethal: " + ("on" if self.game.lethal else "off"),
              self.toggle_lethal),
-            ("mode", lambda: "Manual" if self.manual else "Autonomous", self.toggle_manual),
-            ("reset", lambda: "New specimen", lambda: self.new_specimen("reset by operator")),
-            ("export", lambda: "Export CSV", self.export),
+            ("world", lambda: "World: " + ("plate" if self.mode == "plate" else "grid"),
+             self.toggle_world),
+            ("mode", lambda: "Manual" if self.manual else "Auto", self.toggle_manual),
+            ("reset", lambda: "New worm", lambda: self.new_specimen("reset by operator")),
+            ("export", lambda: "Export", self.export),
         ]
-        widths = [62, 84, 96, 104, 88]
+        widths = [58, 80, 96, 64, 76, 64]
         x = CONTROLS.right - 10 - sum(widths) - 6 * (len(widths) - 1)
         self.buttons = []
         for (key, label, action), w in zip(specs, widths):
             self.buttons.append((pygame.Rect(x, CONTROLS.y + 5, w, 42), label, action))
             x += w + 6
 
+    @property
+    def speed(self):
+        """Console steps per second."""
+        rate = self.rates[self.mode]
+        return rate * STEPS_PER_SECOND if self.mode == "plate" else rate
+
+    def rate_label(self, rate=None):
+        rate = self.rates[self.mode] if rate is None else rate
+        return f"{rate:g}×" if self.mode == "plate" else f"{rate:g} Hz"
+
     def rate_to_u(self, rate):
-        return math.log(rate / RATE_MIN) / math.log(RATE_MAX / RATE_MIN)
+        lo, hi = RATE_RANGE[self.mode]
+        return math.log(rate / lo) / math.log(hi / lo)
 
     def set_rate_from_x(self, x):
+        lo, hi = RATE_RANGE[self.mode]
         u = max(0.0, min(1.0, (x - self.slider.x) / self.slider.w))
-        rate = RATE_MIN * (RATE_MAX / RATE_MIN) ** u
-        self.speed = round(rate * 4) / 4 if rate < 4 else round(rate * 2) / 2
+        rate = lo * (hi / lo) ** u
+        self.rates[self.mode] = round(rate * 4) / 4 if rate < 4 else round(rate * 2) / 2
+        self.rates[self.mode] = max(lo, self.rates[self.mode])
+
+    def nudge_rate(self, factor):
+        lo, hi = RATE_RANGE[self.mode]
+        self.rates[self.mode] = max(lo, min(hi, round(self.rates[self.mode] * factor, 2)))
+
+    def toggle_world(self):
+        self.set_world("grid" if self.mode == "plate" else "plate")
+
+    def set_world(self, mode):
+        self.best = max(self.best, self.game.score)
+        self.mode = mode
+        self.brain.reset()
+        if mode == "plate":
+            self.plate.reset()
+            self.game = self.ctrl = self.plate
+            self.manual = False
+        else:
+            self.grid_game.reset()
+            self.grid_ctrl.reset()
+            self.game, self.ctrl = self.grid_game, self.grid_ctrl
+        self.pending.clear()
+        self.markers.clear()
+        self.prev_body = list(self.game.body)
+        self.prev_nodes = self.cur_nodes = np.array(self.plate.body)
+        self._odour_food = None
+        self.note("world: agar plate (soft body)" if mode == "plate" else "world: grid snake")
 
     def toggle_pause(self):
         self.paused = not self.paused
         self.note("acquisition paused" if self.paused else "acquisition resumed")
 
     def toggle_manual(self):
+        if self.mode == "plate":
+            self.note("manual steering is only available in the grid world")
+            return
         self.manual = not self.manual
         self.note("condition: manual steering" if self.manual else "condition: autonomous")
 
@@ -332,6 +387,8 @@ class Console:
         self.dragging = False
 
     def on_click(self, pos, button):
+        if self.mode == "plate":
+            return self.on_click_plate(pos, button)
         cell = self.cell_at(pos)
         if cell is None:
             return
@@ -351,6 +408,41 @@ class Console:
             self.start_trial("toxin", cell)
             self.note(f"stimulus: toxin droplet at {cell}")
 
+    # plate geometry: world millimetres <-> canvas pixels
+    @property
+    def plate_scale(self):
+        return (min(ARENA.w, ARENA.h) / 2 - 10) / PLATE_RADIUS
+
+    def to_screen(self, p):
+        k = self.plate_scale
+        return (ARENA.centerx + p[0] * k, ARENA.centery + p[1] * k)
+
+    def to_world(self, q):
+        k = self.plate_scale
+        return ((q[0] - ARENA.centerx) / k, (q[1] - ARENA.centery) / k)
+
+    def on_click_plate(self, pos, button):
+        if not ARENA.collidepoint(pos):
+            return
+        w = self.to_world(pos)
+        if math.hypot(*w) > PLATE_RADIUS:
+            return
+        g = self.game
+        label = f"({w[0]:+.2f}, {w[1]:+.2f}) mm"
+        if button == 3:
+            g.place_food(w)
+            self.note(f"food source moved to {label}")
+            return
+        region = g.body_region(w, radius=max(0.12, 9 / self.plate_scale))
+        if region:
+            g.poke(region)
+            self.start_trial(region, (round(w[0], 2), round(w[1], 2)))
+            self.note(f"stimulus: {STIMULI[region][0]} at {label}")
+        else:
+            g.add_toxin(w)
+            self.start_trial("toxin", (round(w[0], 2), round(w[1], 2)))
+            self.note(f"stimulus: toxin droplet at {label}")
+
     def handle_key(self, key):
         if key == pygame.K_SPACE:
             self.toggle_pause()
@@ -360,10 +452,12 @@ class Console:
             self.toggle_lethal()
         elif key == pygame.K_r:
             self.new_specimen("reset by operator")
+        elif key == pygame.K_w:
+            self.toggle_world()
         elif key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
-            self.speed = min(RATE_MAX, round(self.speed * 1.25, 2))
+            self.nudge_rate(1.25)
         elif key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-            self.speed = max(RATE_MIN, round(self.speed / 1.25, 2))
+            self.nudge_rate(1 / 1.25)
         elif key == pygame.K_e:
             self.export()
         elif self.manual and key in (pygame.K_UP, pygame.K_RIGHT, pygame.K_DOWN, pygame.K_LEFT):
@@ -380,6 +474,7 @@ class Console:
         self.ctrl.reset()
         self.pending.clear()
         self.prev_body = list(self.game.body)
+        self.prev_nodes = self.cur_nodes = np.array(self.plate.body)
 
     def export(self):
         out = os.path.join(HERE, "recordings")
@@ -410,6 +505,8 @@ class Console:
         score = g.score
         start_tick = self.tick
         self.prev_body = list(g.body)
+        if self.mode == "plate":
+            self.prev_nodes = np.array(g.body)
         if self.manual:
             c.decide(g)
             g.step(self.manual_turn)
@@ -421,8 +518,11 @@ class Console:
         last = c.last
         if last.get("reverse") and not self.manual:
             self.prev_body.reverse()
-        if g.bumped:
+        if self.mode == "plate":
+            self.cur_nodes = np.array(g.body)
+        if g.bumped and g.bumped != self._last_bump:
             self.note(f"nose contact with {g.bumped} (non-lethal)")
+        self._last_bump = g.bumped
 
         # raster ring buffer
         block = np.array([f[self.raster_order] for f in frames])
@@ -440,7 +540,7 @@ class Console:
         while self.history and self.history[0][0] < self.sim_time - TRACE_SECONDS:
             self.history.popleft()
         self.recording.append({
-            "t_s": round(self.sim_time, 3), "specimen": self.specimen, "step": g.steps,
+            "t_s": round(self.sim_time, 3), "world": self.mode, "specimen": self.specimen, "step": g.steps,
             "head_x": g.body[0][0], "head_y": g.body[0][1], "score": g.score,
             "odour": round(last["odor"], 4), "bumped": g.bumped or "", "toxin_L": round(last["toxin"][0], 3),
             "toxin_R": round(last["toxin"][1], 3), "touch_L": last["touch"][0],
@@ -468,14 +568,15 @@ class Console:
         pygame.draw.rect(s, PANEL, (0, 0, CANVAS[0], 64))
         pygame.draw.line(s, BORDER, (0, 64), (CANVAS[0], 64))
         self.text("OpenWorm Connectome Behaviour Rig", (20, 10), TEXT, self.f_title)
-        self.text("C. elegans hermaphrodite connectome (Cook et al. 2019)  ·  "
-                  f"{self.brain.n_neurons} neurons  ·  {self.brain.n_synapses} synapses  ·  "
-                  "integrate-and-fire, 6 ticks / step", (20, 36), MUTED, self.f_s)
+        self.text(f"C. elegans connectome (Cook et al. 2019)  ·  {self.brain.n_neurons} neurons  ·  "
+                  f"{self.brain.n_synapses} synapses  ·  integrate-and-fire",
+                  (20, 36), MUTED, self.f_s)
         fields = [
             ("EXPERIMENT", self.exp_id),
             ("SPECIMEN", f"#{self.specimen:03d}"),
-            ("CONDITION", "manual" if self.manual else "autonomous"),
-            ("STEP RATE", f"{self.speed:g} Hz"),
+            ("WORLD", "agar plate" if self.mode == "plate" else
+             ("grid · manual" if self.manual else "grid")),
+            ("SPEED" if self.mode == "plate" else "STEP RATE", self.rate_label()),
             ("ELAPSED", f"{self.sim_time:8.1f} s"),
             ("SCORE / BEST", f"{self.game.score} / {max(self.best, self.game.score)}"),
         ]
@@ -492,6 +593,8 @@ class Console:
         self.text(rec, (x - 86, 29), TEXT, self.f_s)
 
     def draw_arena(self):
+        if self.mode == "plate":
+            return self.draw_plate()
         s = self.canvas
         g = self.game
         self.panel(ARENA_PANEL, "Arena",
@@ -604,6 +707,146 @@ class Console:
         self.text("0", (cb.x - 4, cb.y - 3), MUTED, self.f_xs, "topright")
         self.text("1  C", (cb.right + 4, cb.y - 3), MUTED, self.f_xs)
 
+    def draw_plate(self):
+        s = self.canvas
+        g = self.game
+        k = self.plate_scale
+        cx, cy = ARENA.center
+        self.panel(ARENA_PANEL, "Arena",
+                   f"agar plate Ø {2 * PLATE_RADIUS:.0f} mm · food odour C = exp(-d / "
+                   f"{PLATE_ODOR_LENGTH:g} mm) · worm 1 mm")
+
+        # odour field on the agar, hatched outside the plate
+        if self._odour_food != ("plate", g.food):
+            self._odour_food = ("plate", g.food)
+            ix = np.arange(ARENA.w)
+            iy = np.arange(ARENA.h)
+            wx = (ix + 0.5 - ARENA.w / 2) / k
+            wy = (iy + 0.5 - ARENA.h / 2) / k
+            d = np.hypot(wx[:, None] - g.food[0], wy[None, :] - g.food[1])
+            lut = np.array([colormap(v / 255) for v in range(256)], dtype=np.uint8)
+            img = lut[(np.exp(-d / PLATE_ODOR_LENGTH) * 255).astype(np.uint8)]
+            outside = np.hypot(wx[:, None], wy[None, :]) > PLATE_RADIUS
+            hatch = ((ix[:, None] + iy[None, :]) % 7) == 0
+            img[outside] = PANEL
+            img[outside & hatch] = (60, 64, 72)
+            self._odour = pygame.surfarray.make_surface(img)
+        s.blit(self._odour, ARENA.topleft)
+        pygame.draw.circle(s, (170, 176, 186), (cx, cy), int(PLATE_RADIUS * k), 2)
+
+        clip = s.get_clip()
+        s.set_clip(ARENA)
+        # iso-concentration contours around the food
+        fc = self.to_screen(g.food)
+        for level in (0.8, 0.6, 0.4, 0.2):
+            r = -math.log(level) * PLATE_ODOR_LENGTH * k
+            pygame.draw.circle(s, (150, 175, 170), fc, int(r), 1)
+            self.text(f"{level:.1f}", (fc[0] + r * 0.71 + 2, fc[1] - r * 0.71 - 12), (170, 190, 185), self.f_xs)
+        pygame.draw.circle(s, (240, 244, 210), fc, max(4, int(EAT_RADIUS * k)))
+        pygame.draw.circle(s, BG, fc, max(4, int(EAT_RADIUS * k)), 2)
+
+        # toxins: sensing range, lethal core, remaining lifetime
+        for pos, expiry in g.toxins:
+            c = self.to_screen(pos)
+            pygame.draw.circle(s, TOXIN, c, int(PLATE_TOXIN_LENGTH * 3 * k), 1)
+            pygame.draw.circle(s, mix(TOXIN, PANEL, 0.6), c, int(PLATE_TOXIN_LENGTH * 1.5 * k), 1)
+            pygame.draw.circle(s, TOXIN, c, max(4, int(TOXIN_CORE * k)))
+            left = max(0.0, (expiry - g.t) / PLATE_TOXIN_LIFETIME)
+            r = max(4, int(TOXIN_CORE * k)) + 6
+            pygame.draw.arc(s, TEXT, (c[0] - r, c[1] - r, 2 * r, 2 * r), math.pi / 2,
+                            math.pi / 2 + left * 2 * math.pi, 2)
+
+        # head track
+        if len(g.trail) > 1:
+            pts = [self.to_screen(p) for p in g.trail]
+            pygame.draw.lines(s, (86, 104, 124), False, pts, 1)
+
+        # worm body, interpolated between decision windows
+        p = self.step_progress
+        nodes = self.prev_nodes + (self.cur_nodes - self.prev_nodes) * p \
+            if self.prev_nodes.shape == self.cur_nodes.shape else self.cur_nodes
+        pts = [self.to_screen(q) for q in nodes]
+        n = len(pts)
+        rmax = max(3.5, 0.045 * k)
+
+        def radius(u):
+            return rmax * (0.35 + 0.65 * math.sin(math.pi * (0.06 + 0.88 * u)) ** 0.5)
+
+        for grow, shade in ((1.6, lambda u: (10, 12, 15)),
+                            (0.0, lambda u: mix((232, 235, 238), (140, 146, 156), u))):
+            for i in range(n - 1, 0, -1):
+                a, b = pts[i - 1], pts[i]
+                for j in range(4):
+                    t = j / 4
+                    u = (i - 1 + t) / (n - 1)
+                    pygame.draw.circle(s, shade(u), (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t),
+                                       radius(u) + grow)
+        pygame.draw.circle(s, ACCENT, pts[0], 2)
+        self.text("head", (pts[0][0] + 8, pts[0][1] - 18), MUTED, self.f_xs)
+
+        # stimulus markers
+        for pos, t0, color in self.markers:
+            a = 1 - (self.sim_time - t0) / 2.0
+            c = self.to_screen(pos)
+            col = mix(PANEL, color, a)
+            r = int(10 + (1 - a) * 18)
+            pygame.draw.circle(s, col, c, r, 1)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                pygame.draw.line(s, col, (c[0] + dx * (r - 4), c[1] + dy * (r - 4)),
+                                 (c[0] + dx * (r + 6), c[1] + dy * (r + 6)))
+
+        # behavioural state and scale bar
+        last = self.ctrl.last
+        state = last.get("state", "forward") if last else "forward"
+        col = {"reversal": REVERSE, "omega turn": REVERSE, "forward run": FORWARD,
+               "turning": TOUCH}.get(state, MUTED)
+        self.text(f"behaviour: {state}", (ARENA.x + 8, ARENA.y + 6), col, self.f_s)
+        self.text(f"t = {g.t:6.1f} s simulated", (ARENA.x + 8, ARENA.y + 24), FAINT, self.f_xs)
+        x0, y0 = ARENA.x + 16, ARENA.bottom - 16
+        pygame.draw.line(s, TEXT, (x0, y0), (x0 + k, y0), 2)
+        pygame.draw.line(s, TEXT, (x0, y0 - 4), (x0, y0 + 4))
+        pygame.draw.line(s, TEXT, (x0 + k, y0 - 4), (x0 + k, y0 + 4))
+        self.text("1 mm", (x0 + k / 2, y0 - 16), TEXT, self.f_xs, "midtop")
+
+        # hover probe
+        if self.hover and ARENA.collidepoint(self.hover):
+            w = self.to_world(self.hover)
+            if math.hypot(*w) <= PLATE_RADIUS:
+                region = g.body_region(w, radius=max(0.12, 9 / k))
+                lines = [f"({w[0]:+.2f}, {w[1]:+.2f}) mm   odour C = {g.odor_at(w):.3f}"]
+                if g.toxins:
+                    lines.append(f"toxin C = {g.toxin_at(w):.3f}")
+                if region:
+                    lines.append(f"LMB: {STIMULI[region][0]} → {STIMULI[region][1]}")
+                else:
+                    lines.append("LMB: toxin droplet → ASH ADL ASK")
+                lines.append("RMB: move food source here")
+                wbox = max(self.f_s.size(t)[0] for t in lines) + 14
+                box = pygame.Rect(self.hover[0] + 14, self.hover[1] + 10, wbox, 8 + 16 * len(lines))
+                if box.right > ARENA.right:
+                    box.right = self.hover[0] - 14
+                if box.bottom > ARENA.bottom:
+                    box.bottom = self.hover[1] - 10
+                pygame.draw.rect(s, PANEL, box)
+                pygame.draw.rect(s, BORDER, box, 1)
+                for i, t in enumerate(lines):
+                    self.text(t, (box.x + 7, box.y + 4 + i * 16), TEXT if i == 0 else MUTED, self.f_s)
+
+        text, t0 = self.banner
+        if self.sim_time - t0 < 3.0:
+            img = self.f_m.render(text, True, TEXT)
+            box = img.get_rect(midtop=(ARENA.centerx, ARENA.y + 44)).inflate(24, 14)
+            pygame.draw.rect(s, PANEL, box)
+            pygame.draw.rect(s, TOUCH, box, 1)
+            s.blit(img, img.get_rect(center=box.center))
+        s.set_clip(clip)
+
+        cb = pygame.Rect(ARENA_PANEL.right - 170, ARENA_PANEL.y + 9, 110, 8)
+        for i in range(cb.w):
+            pygame.draw.line(s, colormap(i / cb.w), (cb.x + i, cb.y), (cb.x + i, cb.bottom))
+        self.text("0", (cb.x - 4, cb.y - 3), MUTED, self.f_xs, "topright")
+        self.text("1  C", (cb.right + 4, cb.y - 3), MUTED, self.f_xs)
+
     def worm_points(self):
         """Segment centres interpolated between the previous and current step."""
         g = self.game
@@ -656,14 +899,16 @@ class Console:
         pygame.draw.rect(s, PANEL, CONTROLS)
         pygame.draw.rect(s, BORDER, CONTROLS, 1)
         x = CONTROLS.x + 12
-        self.text("STEP RATE", (x, CONTROLS.y + 5), MUTED, self.f_xs)
-        self.text(f"{self.speed:g} Hz", (x, CONTROLS.y + 18), TEXT, self.f_mono_m)
-        self.text(f"{1000 / self.speed:.0f} ms / step", (x, CONTROLS.y + 37), FAINT, self.f_xs)
+        plate = self.mode == "plate"
+        self.text("SIM SPEED" if plate else "STEP RATE", (x, CONTROLS.y + 5), MUTED, self.f_xs)
+        self.text(self.rate_label(), (x, CONTROLS.y + 18), TEXT, self.f_mono_m)
+        self.text("× real time" if plate else f"{1000 / self.speed:.0f} ms / step",
+                  (x, CONTROLS.y + 37), FAINT, self.f_xs)
         sl = self.slider
         pygame.draw.rect(s, GRID, sl, border_radius=3)
-        u = self.rate_to_u(self.speed)
+        u = self.rate_to_u(self.rates[self.mode])
         pygame.draw.rect(s, ACCENT, (sl.x, sl.y, int(sl.w * u), sl.h), border_radius=3)
-        for rate in (0.5, 1, 2, 5, 10, 20):
+        for rate in ((0.25, 0.5, 1, 2, 4) if plate else (0.5, 1, 2, 5, 10, 20)):
             tx = sl.x + sl.w * self.rate_to_u(rate)
             pygame.draw.line(s, FAINT, (tx, sl.y - 5), (tx, sl.y - 2))
             self.text(f"{rate:g}", (tx, sl.y - 18), FAINT, self.f_xs, "midtop")
@@ -913,14 +1158,14 @@ class Console:
         self.draw_footer()
 
 
-def run(speed=3.0, max_frames=None, screenshot=None, script=None):
+def run(speed=3.0, max_frames=None, screenshot=None, script=None, world="plate"):
     # SCALED lets SDL resize the fixed-size canvas with the window, keeping the
     # aspect ratio (letterboxing) and mapping mouse positions back to canvas pixels
     os.environ.setdefault("SDL_RENDER_SCALE_QUALITY", "best")
     pygame.init()
     window = pygame.display.set_mode(CANVAS, pygame.SCALED | pygame.RESIZABLE)
     pygame.display.set_caption("OpenWorm Connectome Behaviour Rig")
-    con = Console(speed)
+    con = Console(speed, world)
     clock = pygame.time.Clock()
     frames = 0
     while True:

@@ -323,10 +323,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headless", type=int, metavar="N", help="play N games without a window and print stats")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--speed", type=float, default=3.0, help="game steps per second")
+    ap.add_argument("--speed", type=float, default=3.0, help="grid world: game steps per second")
+    ap.add_argument("--world", choices=("plate", "grid"), default="plate",
+                    help="start in the agar-plate world (soft body) or the grid snake")
     args = ap.parse_args()
     if args.headless:
         run_headless(args.headless, args.seed)
     else:
         from worm_hud import run
-        run(args.speed)
+        run(args.speed, world=args.world)

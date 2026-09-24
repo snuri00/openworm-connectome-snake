@@ -12,6 +12,10 @@ fire; their accumulated input is read out and cleared every tick
 import csv
 import os
 
+# numpy's BLAS would otherwise spin up one thread per core for tiny arrays
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
